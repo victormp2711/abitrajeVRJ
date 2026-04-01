@@ -5,7 +5,6 @@ import requests
 # Capital fijo por fila de arbitraje (cálculo de cantidades y ganancia en USDT).
 STAKE_USDT = 100.0
 
-
 def load_config(path=None):
     if path is None:
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "arbitraje.ini")
@@ -15,7 +14,6 @@ def load_config(path=None):
     # El .ini usa minimun_profit (ortografía del archivo)
     min_profit = float(section.get("minimun_profit", section.get("minimum_profit", "0")))
     return {"minimum_profit": min_profit}
-
 
 def get_binance_prices():
     print("Getting Binance prices...")
@@ -33,12 +31,12 @@ def get_binance_prices():
     ]
     sorted_pairs = sorted(usdt_pairs, key=lambda x: float(x["volume"]), reverse=True)
 
-    # Tomar las primeras 50 monedas
-    top_50 = sorted_pairs[:50]
+    # Tomar las primeras 150 monedas
+    top_150 = sorted_pairs[:150]
 
     # Crear un diccionario con los precios: {symbol: price}
     binance_prices = {}
-    for ticker in top_50:
+    for ticker in top_150:
         symbol = ticker["symbol"].replace("USDT", "")  # Ejemplo: "BTCUSDT" -> "BTC"
         price = float(ticker["lastPrice"])
         binance_prices[symbol] = price
@@ -46,6 +44,7 @@ def get_binance_prices():
     return binance_prices
 
 def get_kraken_prices():
+    print("Getting Kraken prices...")
     url = "https://api.kraken.com/0/public/Ticker"
     response = requests.get(url)
     response.raise_for_status()
@@ -70,6 +69,7 @@ def get_kraken_prices():
     return kraken_prices
 
 def get_bybit_prices():
+    print("Getting Bybit prices...")
     url = "https://api.bybit.com/v5/market/tickers?category=linear"
     response = requests.get(url)
     response.raise_for_status()
@@ -86,9 +86,27 @@ def get_bybit_prices():
 
     return bybit_prices
 
-def calculate_differences(binance_prices, kraken_prices, bybit_prices, investment_usdt=100):
-    # Encontrar las monedas comunes en los tres exchanges
-    common_symbols = set(binance_prices.keys()) & set(kraken_prices.keys()) & set(bybit_prices.keys())
+def get_huobi_prices():
+    print("Getting Huobi prices...")
+    url = "https://api.huobi.pro/market/tickers"
+    response = requests.get(url)
+    response.raise_for_status()
+    tickers = response.json()
+
+    # Crear un diccionario con los precios: {symbol: price}
+    huobi_prices = {}
+    for ticker in tickers["data"]:
+        if ticker["symbol"].endswith("usdt"):
+            symbol = ticker["symbol"].replace("usdt", "").upper()  # Huobi usa minúsculas
+            price = float(ticker["close"])
+            if price > 0.001:  # Filtrar precios muy bajos
+                huobi_prices[symbol] = price
+
+    return huobi_prices
+
+def calculate_differences(binance_prices, kraken_prices, bybit_prices, huobi_prices, investment_usdt=100):
+    # Encontrar las monedas comunes en los cuatro exchanges
+    common_symbols = set(binance_prices.keys()) & set(kraken_prices.keys()) & set(bybit_prices.keys()) & set(huobi_prices.keys())
 
     # Filtrar monedas con nombres muy cortos (ejemplo: "G", "D")
     common_symbols = [s for s in common_symbols if len(s) > 1]
@@ -96,21 +114,22 @@ def calculate_differences(binance_prices, kraken_prices, bybit_prices, investmen
     # Calcular las diferencias porcentuales y recomendar dónde comprar/vender
     differences = []
     for symbol in common_symbols:
-        binance_price = binance_prices[symbol]
-        kraken_price = kraken_prices[symbol]
-        bybit_price = bybit_prices[symbol]
+        prices = {
+            "Binance": binance_prices[symbol],
+            "Kraken": kraken_prices[symbol],
+            "Bybit": bybit_prices[symbol],
+            "Huobi": huobi_prices[symbol]
+        }
 
         # Calcular diferencias porcentuales
-        difference_binance_kraken = ((kraken_price - binance_price) / binance_price) * 100
-        difference_binance_bybit = ((bybit_price - binance_price) / binance_price) * 100
-        difference_kraken_bybit = ((bybit_price - kraken_price) / kraken_price) * 100
+        difference_binance_kraken = ((prices["Kraken"] - prices["Binance"]) / prices["Binance"]) * 100
+        difference_binance_bybit = ((prices["Bybit"] - prices["Binance"]) / prices["Binance"]) * 100
+        difference_binance_huobi = ((prices["Huobi"] - prices["Binance"]) / prices["Binance"]) * 100
+        difference_kraken_bybit = ((prices["Bybit"] - prices["Kraken"]) / prices["Kraken"]) * 100
+        difference_kraken_huobi = ((prices["Huobi"] - prices["Kraken"]) / prices["Kraken"]) * 100
+        difference_bybit_huobi = ((prices["Huobi"] - prices["Bybit"]) / prices["Bybit"]) * 100
 
         # Determinar dónde comprar (precio más bajo) y dónde vender (precio más alto)
-        prices = {
-            "Binance": binance_price,
-            "Kraken": kraken_price,
-            "Bybit": bybit_price
-        }
         buy_at = min(prices, key=prices.get)
         sell_at = max(prices, key=prices.get)
         buy_price = prices[buy_at]
@@ -122,12 +141,16 @@ def calculate_differences(binance_prices, kraken_prices, bybit_prices, investmen
 
         differences.append({
             "symbol": symbol,
-            "binance_price": binance_price,
-            "kraken_price": kraken_price,
-            "bybit_price": bybit_price,
+            "binance_price": prices["Binance"],
+            "kraken_price": prices["Kraken"],
+            "bybit_price": prices["Bybit"],
+            "huobi_price": prices["Huobi"],
             "difference_binance_kraken": difference_binance_kraken,
             "difference_binance_bybit": difference_binance_bybit,
+            "difference_binance_huobi": difference_binance_huobi,
             "difference_kraken_bybit": difference_kraken_bybit,
+            "difference_kraken_huobi": difference_kraken_huobi,
+            "difference_bybit_huobi": difference_bybit_huobi,
             "buy_at": buy_at,
             "sell_at": sell_at,
             "buy_price": buy_price,
@@ -146,28 +169,26 @@ def print_differences(differences, minimum_profit):
     print(
         f"Oportunidades de arbitraje (inversión {STAKE_USDT:g} USDT por par, ganancia >= {minimum_profit} USDT):"
     )
-    print("-" * 200)
-    print(f"{'Moneda':<10} {'Binance (USDT)':>15} {'Kraken (USD)':>15} {'Bybit (USDT)':>15} {'Comprar en':>10} {'Precio compra':>15} {'Vender en':>10} {'Precio venta':>15} {'Cantidad comprada':>15} {'Monto vendido':>15} {'Ganancia (USDT)':>15}")
-    print("-" * 200)
+    print("-" * 220)
+    print(
+        f"{'Moneda':<10} {'Binance (USDT)':>15} {'Kraken (USD)':>15} {'Bybit (USDT)':>15} {'Huobi (USDT)':>15} "
+        f"{'Comprar en':>10} {'Precio compra':>15} {'Vender en':>10} {'Precio venta':>15} "
+        f"{'Cantidad comprada':>15} {'Monto vendido':>15} {'Ganancia (USDT)':>15}"
+    )
+    print("-" * 220)
 
     if not differences:
         print("(Ninguna oportunidad cumple el umbral de ganancia mínima.)")
         return
 
     for diff in differences:
-        symbol = diff["symbol"]
-        binance_price = diff["binance_price"]
-        kraken_price = diff["kraken_price"]
-        bybit_price = diff["bybit_price"]
-        buy_at = diff["buy_at"]
-        sell_at = diff["sell_at"]
-        buy_price = diff["buy_price"]
-        sell_price = diff["sell_price"]
-        amount_bought = diff["amount_bought"]
-        amount_sold = diff["amount_sold"]
-        profit = diff["profit"]
-
-        print(f"{symbol:<10} {binance_price:>15.6f} {kraken_price:>15.6f} {bybit_price:>15.6f} {buy_at:>10} {buy_price:>15.6f} {sell_at:>10} {sell_price:>15.6f} {amount_bought:>15.6f} {amount_sold:>15.6f} {profit:>15.6f}")
+        if diff["profit"] >= minimum_profit:
+            print(
+                f"{diff['symbol']:<10} {diff['binance_price']:>15.6f} {diff['kraken_price']:>15.6f} "
+                f"{diff['bybit_price']:>15.6f} {diff['huobi_price']:>15.6f} {diff['buy_at']:>10} "
+                f"{diff['buy_price']:>15.6f} {diff['sell_at']:>10} {diff['sell_price']:>15.6f} "
+                f"{diff['amount_bought']:>15.6f} {diff['amount_sold']:>15.6f} {diff['profit']:>15.6f}"
+            )
 
 if __name__ == "__main__":
     try:
@@ -177,8 +198,10 @@ if __name__ == "__main__":
         binance_prices = get_binance_prices()
         kraken_prices = get_kraken_prices()
         bybit_prices = get_bybit_prices()
+        huobi_prices = get_huobi_prices()
+
         differences = calculate_differences(
-            binance_prices, kraken_prices, bybit_prices, investment_usdt=STAKE_USDT
+            binance_prices, kraken_prices, bybit_prices, huobi_prices, investment_usdt=STAKE_USDT
         )
         filtered = [d for d in differences if d["profit"] >= min_profit]
         print_differences(filtered, min_profit)
