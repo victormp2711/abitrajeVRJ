@@ -13,7 +13,179 @@ def load_config(path=None):
     section = parser["DEFAULT"]
     # El .ini usa minimun_profit (ortografía del archivo)
     min_profit = float(section.get("minimun_profit", section.get("minimum_profit", "0")))
-    return {"minimum_profit": min_profit}
+    require_transfer = section.get("require_active_transfer", "0").strip().startswith("1")
+    return {"minimum_profit": min_profit, "require_active_transfer": require_transfer}
+
+
+def _kraken_base_to_symbol(base: str) -> str:
+    m = {"XXBT": "BTC", "XETH": "ETH", "XXDG": "DOGE", "XDG": "DOGE", "XXRP": "XRP"}
+    return m.get(base, base)
+
+
+def _kraken_alt_to_symbol(altname: str) -> str:
+    al = (altname or "").upper()
+    if al == "XBT":
+        return "BTC"
+    if al == "XDG":
+        return "DOGE"
+    return al
+
+
+def fetch_binance_spot_trading_map():
+    r = requests.get("https://api.binance.com/api/v3/exchangeInfo", timeout=90)
+    r.raise_for_status()
+    out = {}
+    for s in r.json()["symbols"]:
+        sym = s["symbol"]
+        if not sym.endswith("USDT"):
+            continue
+        base = sym[:-4]
+        ok = s.get("status") == "TRADING"
+        perms = s.get("permissions") or []
+        if perms:
+            ok = ok and "SPOT" in perms
+        out[base] = ok
+    return out
+
+
+def fetch_huobi_spot_trading_map():
+    r = requests.get("https://api.huobi.pro/v1/common/symbols", timeout=90)
+    r.raise_for_status()
+    out = {}
+    for s in r.json()["data"]:
+        sym = s.get("symbol", "")
+        if not sym.endswith("usdt"):
+            continue
+        base = sym[:-4].upper()
+        ok = s.get("state") == "online" and s.get("api-trading") == "enabled"
+        out[base] = ok
+    return out
+
+
+def fetch_huobi_deposit_map():
+    r = requests.get("https://api.huobi.pro/v2/reference/currencies", timeout=120)
+    r.raise_for_status()
+    out = {}
+    for cur in r.json().get("data") or []:
+        ccy = (cur.get("currency") or "").upper()
+        inst_ok = cur.get("instStatus") == "normal"
+        chains = cur.get("chains") or []
+        dep_ok = any(ch.get("depositStatus") == "allowed" for ch in chains)
+        out[ccy] = inst_ok and dep_ok
+    return out
+
+
+def fetch_kraken_tradable_bases_usd():
+    r = requests.get("https://api.kraken.com/0/public/AssetPairs", timeout=90)
+    r.raise_for_status()
+    bases = set()
+    quotes = {"ZUSD", "ZUSDT", "USDT", "USDC", "DAI"}
+    for info in r.json()["result"].values():
+        if info.get("status") != "online":
+            continue
+        if info.get("quote") not in quotes:
+            continue
+        bases.add(_kraken_base_to_symbol(info["base"]))
+    return bases
+
+
+def fetch_kraken_deposit_enabled_map():
+    r = requests.get("https://api.kraken.com/0/public/Assets", timeout=90)
+    r.raise_for_status()
+    out = {}
+    for aid, info in r.json()["result"].items():
+        norm = _kraken_alt_to_symbol(info.get("altname") or aid)
+        enabled = info.get("status") == "enabled"
+        if norm not in out:
+            out[norm] = enabled
+        else:
+            out[norm] = out[norm] or enabled
+    return out
+
+
+def fetch_bybit_linear_trading_map():
+    out = {}
+    cursor = None
+    while True:
+        params = {"category": "linear", "limit": 500}
+        if cursor:
+            params["cursor"] = cursor
+        r = requests.get("https://api.bybit.com/v5/market/instruments-info", params=params, timeout=90)
+        r.raise_for_status()
+        body = r.json()
+        if body.get("retCode") != 0:
+            raise RuntimeError(body.get("retMsg", "Bybit instruments-info"))
+        lst = body["result"]["list"]
+        for row in lst:
+            sym = row.get("symbol", "")
+            if not sym.endswith("USDT"):
+                continue
+            base = sym[:-4]
+            out[base] = row.get("status") == "Trading"
+        cursor = body["result"].get("nextPageCursor") or ""
+        if not cursor:
+            break
+    return out
+
+
+def fetch_exchange_availability():
+    print("Cargando estado de mercado (compra spot/perp y depósitos públicos)...")
+    return {
+        "binance_spot": fetch_binance_spot_trading_map(),
+        "huobi_spot": fetch_huobi_spot_trading_map(),
+        "huobi_deposit": fetch_huobi_deposit_map(),
+        "kraken_tradable": fetch_kraken_tradable_bases_usd(),
+        "kraken_deposit": fetch_kraken_deposit_enabled_map(),
+        "bybit_linear": fetch_bybit_linear_trading_map(),
+    }
+
+
+def buy_market_active(exchange: str, symbol: str, av: dict) -> bool:
+    s = symbol.upper()
+    if exchange == "Binance":
+        return av["binance_spot"].get(s, False)
+    if exchange == "Huobi":
+        return av["huobi_spot"].get(s, False)
+    if exchange == "Kraken":
+        return s in av["kraken_tradable"]
+    if exchange == "Bybit":
+        return av["bybit_linear"].get(s, False)
+    return False
+
+
+def sell_exchange_deposit_active(exchange: str, symbol: str, av: dict):
+    """
+    True/False si la API pública indica depósitos permitidos para el activo.
+    None = no verificable sin API key (Binance) o no aplica igual que spot (Bybit perp USDT-m).
+    """
+    s = symbol.upper()
+    if exchange == "Binance":
+        return None
+    if exchange == "Huobi":
+        return av["huobi_deposit"].get(s, False)
+    if exchange == "Kraken":
+        return av["kraken_deposit"].get(s, False)
+    if exchange == "Bybit":
+        return None
+    return None
+
+
+def attach_transfer_flags(diff: dict, av: dict) -> None:
+    buy_ex = diff["buy_at"]
+    sell_ex = diff["sell_at"]
+    sym = diff["symbol"]
+    buy_ok = buy_market_active(buy_ex, sym, av)
+    dep = sell_exchange_deposit_active(sell_ex, sym, av)
+    diff["buy_market_ok"] = buy_ok
+    diff["sell_deposit_ok"] = dep
+    if not buy_ok:
+        diff["transfer_route_ok"] = False
+    elif dep is True:
+        diff["transfer_route_ok"] = True
+    elif dep is False:
+        diff["transfer_route_ok"] = False
+    else:
+        diff["transfer_route_ok"] = None
 
 def get_binance_prices():
     print("Getting Binance prices...")
@@ -104,7 +276,14 @@ def get_huobi_prices():
 
     return huobi_prices
 
-def calculate_differences(binance_prices, kraken_prices, bybit_prices, huobi_prices, investment_usdt=100):
+def calculate_differences(
+    binance_prices,
+    kraken_prices,
+    bybit_prices,
+    huobi_prices,
+    investment_usdt=100,
+    availability=None,
+):
     # Encontrar las monedas comunes en los cuatro exchanges
     common_symbols = set(binance_prices.keys()) & set(kraken_prices.keys()) & set(bybit_prices.keys()) & set(huobi_prices.keys())
 
@@ -139,7 +318,7 @@ def calculate_differences(binance_prices, kraken_prices, bybit_prices, huobi_pri
         amount_sold = amount_bought * sell_price
         profit = amount_sold - investment_usdt
 
-        differences.append({
+        row = {
             "symbol": symbol,
             "binance_price": prices["Binance"],
             "kraken_price": prices["Kraken"],
@@ -157,25 +336,46 @@ def calculate_differences(binance_prices, kraken_prices, bybit_prices, huobi_pri
             "sell_price": sell_price,
             "amount_bought": amount_bought,
             "amount_sold": amount_sold,
-            "profit": profit
-        })
+            "profit": profit,
+        }
+        if availability is not None:
+            attach_transfer_flags(row, availability)
+        differences.append(row)
 
     # Ordenar por ganancia (de mayor a menor)
     differences.sort(key=lambda x: x["profit"], reverse=True)
 
     return differences
 
+def _fmt_tri(v):
+    if v is True:
+        return "Si"
+    if v is False:
+        return "No"
+    return "N/D"
+
+
+def _arbitraje_valido_si_no(diff: dict) -> str:
+    """Si = compra operativa y depósito en venta confirmados por API pública."""
+    return "Si" if diff.get("transfer_route_ok") is True else "No"
+
+
 def print_differences(differences, minimum_profit):
     print(
         f"Oportunidades de arbitraje (inversión {STAKE_USDT:g} USDT por par, ganancia >= {minimum_profit} USDT):"
     )
-    print("-" * 220)
     print(
-        f"{'Moneda':<10} {'Binance (USDT)':>15} {'Kraken (USD)':>15} {'Bybit (USDT)':>15} {'Huobi (USDT)':>15} "
-        f"{'Comprar en':>10} {'Precio compra':>15} {'Vender en':>10} {'Precio venta':>15} "
-        f"{'Cantidad comprada':>15} {'Monto vendido':>15} {'Ganancia (USDT)':>15}"
+        "Compra OK = mercado operativo en broker de compra; Dep venta = depósito del activo permitido (API pública). "
+        "N/D en Binance (sin API key) y Bybit (perp USDT-m, no equivale a depósito on-chain del mismo criterio). "
+        "Válido = Si solo si Ruta verificable completa (misma condición que columna Ruta = Si)."
     )
-    print("-" * 220)
+    print("-" * 272)
+    print(
+        f"{'Moneda':<10} {'Binance':>12} {'Kraken':>12} {'Bybit':>12} {'Huobi':>12} "
+        f"{'Comprar':>8} {'P.compra':>12} {'Vender':>8} {'P.venta':>12} "
+        f"{'Ganancia':>12} {'Cpra OK':>7} {'Dep.Vta':>7} {'Ruta':>5} {'Valido':>7}"
+    )
+    print("-" * 272)
 
     if not differences:
         print("(Ninguna oportunidad cumple el umbral de ganancia mínima.)")
@@ -183,27 +383,40 @@ def print_differences(differences, minimum_profit):
 
     for diff in differences:
         if diff["profit"] >= minimum_profit:
+            buy_m = diff.get("buy_market_ok")
+            dep = diff.get("sell_deposit_ok")
+            route = diff.get("transfer_route_ok")
             print(
-                f"{diff['symbol']:<10} {diff['binance_price']:>15.6f} {diff['kraken_price']:>15.6f} "
-                f"{diff['bybit_price']:>15.6f} {diff['huobi_price']:>15.6f} {diff['buy_at']:>10} "
-                f"{diff['buy_price']:>15.6f} {diff['sell_at']:>10} {diff['sell_price']:>15.6f} "
-                f"{diff['amount_bought']:>15.6f} {diff['amount_sold']:>15.6f} {diff['profit']:>15.6f}"
+                f"{diff['symbol']:<10} {diff['binance_price']:>12.6f} {diff['kraken_price']:>12.6f} "
+                f"{diff['bybit_price']:>12.6f} {diff['huobi_price']:>12.6f} {diff['buy_at']:>8} "
+                f"{diff['buy_price']:>12.6f} {diff['sell_at']:>8} {diff['sell_price']:>12.6f} "
+                f"{diff['profit']:>12.6f} {_fmt_tri(buy_m):>7} {_fmt_tri(dep):>7} "
+                f"{_fmt_tri(route):>5} {_arbitraje_valido_si_no(diff):>7}"
             )
 
 if __name__ == "__main__":
     try:
         cfg = load_config()
         min_profit = cfg["minimum_profit"]
+        require_transfer = cfg["require_active_transfer"]
 
         binance_prices = get_binance_prices()
         kraken_prices = get_kraken_prices()
         bybit_prices = get_bybit_prices()
         huobi_prices = get_huobi_prices()
+        availability = fetch_exchange_availability()
 
         differences = calculate_differences(
-            binance_prices, kraken_prices, bybit_prices, huobi_prices, investment_usdt=STAKE_USDT
+            binance_prices,
+            kraken_prices,
+            bybit_prices,
+            huobi_prices,
+            investment_usdt=STAKE_USDT,
+            availability=availability,
         )
         filtered = [d for d in differences if d["profit"] >= min_profit]
+        if require_transfer:
+            filtered = [d for d in filtered if d.get("transfer_route_ok") is True]
         print_differences(filtered, min_profit)
     except requests.exceptions.RequestException as e:
         print(f"Error al conectar con las APIs: {e}")

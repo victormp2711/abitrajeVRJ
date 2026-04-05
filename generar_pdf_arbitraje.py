@@ -15,9 +15,12 @@ from reportlab.platypus import (
 
 from ArbitrajeMain import (
     STAKE_USDT,
+    _arbitraje_valido_si_no,
     calculate_differences,
+    fetch_exchange_availability,
     get_binance_prices,
     get_bybit_prices,
+    get_huobi_prices,
     get_kraken_prices,
     load_config,
 )
@@ -41,6 +44,7 @@ def build_story():
 
     cfg = load_config()
     minimum_profit = cfg["minimum_profit"]
+    require_transfer = cfg.get("require_active_transfer", False)
 
     story = []
     story.append(Paragraph("Diagrama de Arbitraje entre Binance, Kraken y Bybit", title_style))
@@ -128,10 +132,19 @@ profit        = amount_sold - {STAKE_USDT:g}""",
         binance_prices = get_binance_prices()
         kraken_prices = get_kraken_prices()
         bybit_prices = get_bybit_prices()
+        huobi_prices = get_huobi_prices()
+        availability = fetch_exchange_availability()
         differences = calculate_differences(
-            binance_prices, kraken_prices, bybit_prices, investment_usdt=STAKE_USDT
+            binance_prices,
+            kraken_prices,
+            bybit_prices,
+            huobi_prices,
+            investment_usdt=STAKE_USDT,
+            availability=availability,
         )
         filtered = [d for d in differences if d["profit"] >= minimum_profit]
+        if require_transfer:
+            filtered = [d for d in filtered if d.get("transfer_route_ok") is True]
 
         if not filtered:
             story.append(
@@ -142,18 +155,27 @@ profit        = amount_sold - {STAKE_USDT:g}""",
             )
             return story
 
-        rows = [["Moneda", "Comprar en", "Vender en", "Ganancia (USDT)"]]
+        rows = [["Moneda", "Comprar", "Vender", "Ganancia", "Cpra OK", "Dep.Vta", "Ruta", "Valido"]]
         for d in filtered[:40]:
+            dep = d.get("sell_deposit_ok")
+            dep_txt = "Si" if dep is True else ("No" if dep is False else "N/D")
+            route = d.get("transfer_route_ok")
+            route_txt = "Si" if route is True else ("No" if route is False else "N/D")
+            buy_txt = "Si" if d.get("buy_market_ok") else "No"
             rows.append(
                 [
                     d["symbol"],
                     d["buy_at"],
                     d["sell_at"],
                     f"{d['profit']:.6f}",
+                    buy_txt,
+                    dep_txt,
+                    route_txt,
+                    _arbitraje_valido_si_no(d),
                 ]
             )
 
-        table = Table(rows, colWidths=[90, 110, 110, 120], repeatRows=1)
+        table = Table(rows, colWidths=[65, 78, 78, 72, 50, 50, 44, 44], repeatRows=1)
         table.setStyle(
             TableStyle(
                 [
