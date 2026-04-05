@@ -187,7 +187,7 @@ profit        = amount_sold - {STAKE_USDT:g}""",
                     ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
                     ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.lightgrey]),
                 ]
-            )
+            ) 
         )
         story.append(table)
     except requests.exceptions.RequestException as exc:
@@ -204,7 +204,7 @@ profit        = amount_sold - {STAKE_USDT:g}""",
 def main():
     doc = SimpleDocTemplate(OUTPUT_FILE, pagesize=A4)
     doc.build(build_story())
-    print(f"PDF generado: {OUTPUT_FILE}")
+    print(f"PDF generado : {OUTPUT_FILE}")
 
 
 if __name__ == "__main__":
